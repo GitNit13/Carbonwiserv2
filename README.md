@@ -50,6 +50,20 @@ In a notebook, call `main(["train", "--no-tune"])` instead.
 
 `backtest` replays one job per day through 2026. Each start time is chosen from the forecast and then scored on what the grid actually did. It compares running immediately, scheduling on a persistence forecast, scheduling on the XGBoost forecast, and perfect foresight.
 
+## Scheduling results (2026 backtest)
+
+One flexible job per day was submitted at 12:00 UTC (2-hour job, 0.5 kW, 24-hour deadline) over 303 days.
+Each start time was chosen from the forecast only and scored on the grid's actual carbon intensity.
+
+| Strategy | Total gCO2 | Saved vs run-now |
+|---|---|---|
+| Run immediately | 28,554 | 0.0% |
+| Schedule on "same hour yesterday" | 28,591 | -0.1% |
+| Schedule on XGBoost forecast | 23,198 | 18.8% |
+| Perfect foresight (upper limit) | 21,289 | 25.4% |
+
+The forecast captures 74% of the saving that perfect foresight would give. It beat running immediately on 49% of days and was worse on 18%.
+
 ## Limitations
 
 - Great Britain only. Times are UTC.
