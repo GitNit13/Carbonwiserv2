@@ -5,7 +5,10 @@ then use the forecasts to pick the greenest start time for a flexible job (Sched
 Commands
     python CarbonwiserXGBoost.py train                 # train + evaluate (tuning on, takes a few minutes)
     python CarbonwiserXGBoost.py train --no-tune       # quick run with default parameters
-    python CarbonwiserXGBoost.py schedule --now "2026-10-20 12:00"
+    python CarbonwiserXGBoost.py refit                 # retrain on ALL data (needed once before 'live')
+    python CarbonwiserXGBoost.py live                  # forecast the next 48h from NOW with the real weather forecast
+    python CarbonwiserXGBoost.py check                 # score earlier live forecasts against what really happened
+    python CarbonwiserXGBoost.py schedule --now "2026-10-20 12:00"   # replay on stored history
     python CarbonwiserXGBoost.py backtest              # does forecast-based scheduling really save CO2?
 
 In a notebook (Colab/Jupyter) call main() with a list instead:
@@ -20,13 +23,21 @@ Design (no data leakage)
 
 Split: tune and fit on data up to 2025-12-31, test on 2026 (never used for any choice).
 
+Live mode
+    'live' downloads the last ~5 weeks of GB carbon intensity (NESO) and the current Open-Meteo weather forecast
+    for the same six GB points used in training, builds exactly the same features, and predicts the next 48 hours.
+    Hours now .. now+23 use the 24h model, hours now+24 .. now+47 use the 48h model.
+    Every run is appended to live_log.csv; 'check' scores those forecasts once the hours have passed.
+
 Files used / written (same folder as this script)
     in : gb_carbon_weather_cleaned.csv, Scheduler.py
-    out: predictions_v2_24h.csv, predictions_v2_48h.csv, models/, forecast_v2_*.png, carbonwise.csv
+    out: predictions_v2_24h.csv, predictions_v2_48h.csv, models/, forecast_v2_*.png, carbonwise.csv,
+         live_forecast.csv, live_log.csv, live_forecast.png
 
 All times are UTC (GB data).
 """
 import argparse
+import glob
 import json
 import os
 import sys
@@ -59,6 +70,23 @@ FOLDS = [
 DEFAULT_PARAMS = dict(max_depth=6, learning_rate=0.03, min_child_weight=5,
                       subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, reg_alpha=0.0)
 WEATHER_VARS = ["temperature_2m", "wind_speed_10m", "cloud_cover", "shortwave_radiation"]
+
+# Live mode: the same six GB points used to build the training data (names must match the CSV column names)
+LOCATIONS = {
+    "south":     (51.5, -0.1),   # London: demand + temperature
+    "southwest": (50.6, -4.2),   # Cornwall/Devon: solar
+    "midlands":  (52.6, -1.5),   # demand
+    "scotland":  (55.9, -3.2),   # onshore wind
+    "northsea":  (53.5, 1.5),    # offshore wind
+    "irishsea":  (53.8, -3.8),   # offshore wind
+}
+LIVE_HISTORY_DAYS = 35           # carbon history needed for the 30-day and 7-day features
+CI_URL = "https://api.carbonintensity.org.uk/intensity/{start}/{end}"
+CI_FW48_URL = "https://api.carbonintensity.org.uk/intensity/{start}/fw48h"
+PREV_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+CI_FMT = "%Y-%m-%dT%H:%MZ"
+LIVE_FORECAST = os.path.join(HERE, "live_forecast.csv")
+LIVE_LOG = os.path.join(HERE, "live_log.csv")
 # ------------------------------------------
 
 
@@ -85,7 +113,7 @@ def locations(df):
     return sorted({c.split("_previous_day")[1][2:] for c in df.columns if "_previous_day" in c})
 
 
-def make_features(df, H):
+def make_features(df, H, require_target=True):
     y = df["ci_actual"]
     d = H // 24                       # 24h -> day-1 weather forecast, 48h -> day-2 forecast
     locs = locations(df)
@@ -151,6 +179,8 @@ def make_features(df, H):
             X[f"{v}_day2_mean"] = c2
             X[f"{v}_revision"] = c1 - c2
 
+    if not require_target:          # live mode: the target hours are in the future
+        return X, y
     keep = y.notna() & X[f"ci_lag_{H}"].notna()
     return X[keep], y[keep]
 
@@ -351,6 +381,13 @@ def write_csv(f, path=OUT):
     }).to_csv(path, index=False)
 
 
+def run_scheduler(S, job_hours, deadline, power):
+    S.JOB_HOURS = S.JOB_HOURS if job_hours is None else job_hours
+    S.DEADLINE_HOURS = S.DEADLINE_HOURS if deadline is None else deadline
+    S.POWER_KW = S.POWER_KW if power is None else power
+    S.main(OUT)
+
+
 def schedule_cmd(now_text, hours, job_hours, deadline, power):
     S = import_scheduler()
     p24, p48 = load_predictions()
@@ -358,15 +395,12 @@ def schedule_cmd(now_text, hours, job_hours, deadline, power):
     f = forecast_window(now, min(hours, 48), p24, p48)
     write_csv(f)
     print(f"Wrote {OUT}: {len(f)} hourly forecasts from {now:%Y-%m-%d %H:%M} UTC\n")
-    S.JOB_HOURS = S.JOB_HOURS if job_hours is None else job_hours
-    S.DEADLINE_HOURS = S.DEADLINE_HOURS if deadline is None else deadline
-    S.POWER_KW = S.POWER_KW if power is None else power
-    S.main(OUT)
+    run_scheduler(S, job_hours, deadline, power)
 
 
-def backtest_cmd(hour, job_hours, deadline, power):
+def backtest_run(hour, job_hours, deadline, power):
     """Replay the scheduler once a day. Each choice is made from the forecast only, then scored on
-    what the grid actually did."""
+    what the grid actually did. Returns (one row per day, (job_hours, deadline, power))."""
     S = import_scheduler()
     job_hours = S.JOB_HOURS if job_hours is None else job_hours
     deadline = min(S.DEADLINE_HOURS if deadline is None else deadline, 48)
@@ -386,6 +420,7 @@ def backtest_cmd(hour, job_hours, deadline, power):
         s_fc, _ = S.best_start(f.values, job_hours, deadline, power)
         s_or, _ = S.best_start(a.values, job_hours, deadline, power)   # perfect foresight
         row = {
+            "date": now,
             "run_now": S.co2(a.values, 0, job_hours, power),
             "forecast": S.co2(a.values, s_fc, job_hours, power),
             "oracle": S.co2(a.values, s_or, job_hours, power),
@@ -399,7 +434,11 @@ def backtest_cmd(hour, job_hours, deadline, power):
 
     if not rows:
         raise SystemExit("No usable days for the backtest.")
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows), (job_hours, deadline, power)
+
+
+def backtest_cmd(hour, job_hours, deadline, power):
+    df, (job_hours, deadline, power) = backtest_run(hour, job_hours, deadline, power)
     print(f"Backtest: {len(df)} days, one job per day starting {hour:02d}:00 UTC, "
           f"{job_hours}h job, deadline {deadline}h, {power} kW\n")
     base = df["run_now"].sum()
@@ -415,6 +454,265 @@ def backtest_cmd(hour, job_hours, deadline, power):
     print(f"\nThe forecast captures {share:.0f}% of the saving that perfect foresight would give.")
     print(f"Forecast-based choice beat running now on {(df['forecast'] < df['run_now']).mean() * 100:.0f}% of days "
           f"and was worse on {(df['forecast'] > df['run_now']).mean() * 100:.0f}%.")
+
+
+# =====================================================================
+# Live forecasting: latest carbon data + the real weather forecast for Great Britain
+# =====================================================================
+def get_json(url, params=None, tries=4):
+    import time
+    import requests
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            if i == tries - 1:
+                raise
+            print(f"  retrying after error: {e}")
+            time.sleep(2 * (i + 1))
+
+
+def fetch_carbon_hourly(start, end):
+    """Hourly mean of actual GB carbon intensity between two UTC timestamps (NESO Carbon Intensity API)."""
+    rows = []
+    cur = start
+    while cur < end:
+        nxt = min(cur + pd.Timedelta(days=13), end)       # the API allows about 14 days per request
+        data = get_json(CI_URL.format(start=cur.strftime(CI_FMT), end=nxt.strftime(CI_FMT)))["data"]
+        for item in data:
+            rows.append((item.get("from"), (item.get("intensity") or {}).get("actual")))
+        cur = nxt
+    if not rows:
+        return pd.Series(dtype=float)
+    d = pd.DataFrame(rows, columns=["t", "v"])
+    d["t"] = pd.to_datetime(d["t"], utc=True)
+    d["v"] = pd.to_numeric(d["v"], errors="coerce")
+    return d.drop_duplicates("t").set_index("t")["v"].sort_index().resample("1h").mean()
+
+
+def fetch_neso_forecast(now):
+    """NESO's own 48h forecast, only shown for comparison. Never stops the run if it fails."""
+    try:
+        data = get_json(CI_FW48_URL.format(start=now.strftime(CI_FMT)))["data"]
+        s = pd.Series({pd.Timestamp(i["from"]): (i.get("intensity") or {}).get("forecast") for i in data})
+        s.index = pd.to_datetime(s.index, utc=True)
+        return pd.to_numeric(s, errors="coerce").sort_index().resample("1h").mean()
+    except Exception as e:
+        print(f"(NESO comparison forecast not available: {e})")
+        return None
+
+
+def fetch_weather_live(now):
+    """Weather forecasts for the six GB points in the same 'previous_day1 / previous_day2' form as the
+    training data: for each target hour, the forecast issued 1 and 2 days before it."""
+    hourly = []
+    for v in WEATHER_VARS:
+        hourly += [v, f"{v}_previous_day1", f"{v}_previous_day2"]
+    cols, filled = {}, 0
+    for name, (lat, lon) in LOCATIONS.items():
+        data = get_json(PREV_RUNS_URL, params={
+            "latitude": lat, "longitude": lon, "hourly": ",".join(hourly),
+            "past_days": 3, "forecast_days": 4, "timezone": "GMT"})["hourly"]
+        w = pd.DataFrame(data)
+        w.index = pd.to_datetime(w.pop("time"), utc=True)
+        for v in WEATHER_VARS:
+            for d in (1, 2):
+                col = f"{v}_previous_day{d}"
+                s = w[col] if col in w else pd.Series(np.nan, index=w.index)
+                needed = (w.index >= now - pd.Timedelta(hours=12)) & (w.index < now + pd.Timedelta(hours=24 * d))
+                filled += int((s.isna() & needed).sum())
+                cols[f"{col}_{name}"] = s.fillna(w[v])     # fall back to the current forecast if a run is missing
+    if filled:
+        print(f"(note: {filled} weather values were missing for the previous-day forecasts "
+              f"and were replaced by the current forecast)")
+    return pd.DataFrame(cols)
+
+
+def build_live_frame(now):
+    """One hourly table in the same layout as the training CSV, running from 35 days back to now+47h.
+    ci_actual is empty for the future; weather columns hold the real forecasts."""
+    ci = fetch_carbon_hourly(now - pd.Timedelta(days=LIVE_HISTORY_DAYS), now)
+    if ci.dropna().empty:
+        raise SystemExit("No carbon intensity data came back from the NESO API.")
+    lag_h = (now - ci.dropna().index.max()) / pd.Timedelta(hours=1)
+    if lag_h > 3:
+        print(f"(warning: the latest carbon value is {lag_h:.0f}h old, forecasts may be less accurate)")
+    weather = fetch_weather_live(now)
+    idx = pd.date_range(now - pd.Timedelta(days=LIVE_HISTORY_DAYS), now + pd.Timedelta(hours=47), freq="1h")
+    live = pd.DataFrame(index=idx)
+    live["ci_actual"] = ci.reindex(idx)
+    live.loc[live.index >= now, "ci_actual"] = np.nan        # only complete hours before now are known
+    return live.join(weather.reindex(idx))
+
+
+def load_models(H):
+    """Prefer the models refit on all data ('refit'); fall back to the ones trained for the 2026 test."""
+    import xgboost as xgb
+    for prefix in ("final_", ""):
+        info_path = os.path.join(MODEL_DIR, f"{prefix}model_info_{H}h.json")
+        paths = sorted(glob.glob(os.path.join(MODEL_DIR, f"{prefix}xgb_{H}h_seed*.json")))
+        if os.path.exists(info_path) and paths:
+            with open(info_path) as f:
+                info = json.load(f)
+            models = []
+            for p in paths:
+                m = xgb.XGBRegressor()
+                m.load_model(p)
+                models.append(m)
+            if prefix == "":
+                print(f"(note: using the {H}h models trained through {info['trained_through'][:10]} only. "
+                      f"Run 'refit' to include all your data.)")
+            return models, info
+    raise SystemExit(f"No saved {H}h models found in {MODEL_DIR}. Run 'train' first (then 'refit').")
+
+
+def refit_cmd(csv_path, seeds):
+    """Retrain both horizons on ALL rows (including 2026), reusing the parameters found by 'train'."""
+    try:
+        import xgboost  # noqa: F401
+    except ImportError:
+        raise SystemExit("xgboost is not installed. Run: pip install -r requirements.txt")
+    df = load(csv_path)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    for H in HORIZONS:
+        X, y = make_features(df, H)
+        info_path = os.path.join(MODEL_DIR, f"model_info_{H}h.json")
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                old = json.load(f)
+            params, n_trees = old["params"], old["n_trees"]
+        else:
+            print(f"(no tuned parameters found for {H}h, using the defaults. Run 'train' first for better results.)")
+            params, n_trees = DEFAULT_PARAMS, 600
+        print(f"refitting {H}h model on {len(X)} rows through {X.index.max():%Y-%m-%d} ...")
+        for s in range(seeds):
+            m = fit_xgb(params, X, y, n_estimators=n_trees, seed=s, early=False)
+            m.save_model(os.path.join(MODEL_DIR, f"final_xgb_{H}h_seed{s}.json"))
+        with open(os.path.join(MODEL_DIR, f"final_model_info_{H}h.json"), "w") as f:
+            json.dump({"horizon_hours": H, "params": params, "n_trees": n_trees,
+                       "features": list(X.columns), "trained_through": str(X.index.max())}, f, indent=2)
+    print(f"Saved final models in {MODEL_DIR}. Next: python CarbonwiserXGBoost.py live")
+
+
+def live_forecast(now=None):
+    """Forecast the next 48 hours from now. Returns (forecast table, forecast origin).
+    Used by both the command line ('live') and the GUI. (The 'now' argument is only for testing.)"""
+    now = (pd.Timestamp.now(tz="UTC") if now is None else now).floor("1h")
+    models = {H: load_models(H) for H in HORIZONS}
+    print(f"Forecast origin: {now:%Y-%m-%d %H:%M} UTC")
+
+    live = build_live_frame(now)
+
+    parts = []
+    for H, first in ((24, 0), (48, 24)):                 # now..now+23 -> 24h model, now+24..now+47 -> 48h model
+        ens, info = models[H]
+        X, _ = make_features(live, H, require_target=False)
+        targets = pd.date_range(now + pd.Timedelta(hours=first), periods=24, freq="1h")
+        Xt = X.reindex(targets)
+        missing = [c for c in info["features"] if c not in Xt.columns]
+        if missing:
+            raise SystemExit(f"Features missing in live data: {missing[:5]} ... "
+                             "(if 'is_holiday' is listed, run: pip install holidays)")
+        Xt = Xt[info["features"]]
+        if Xt[f"ci_lag_{H}"].isna().any():
+            print(f"(warning: {int(Xt[f'ci_lag_{H}'].isna().sum())} {H}h rows have no recent carbon value)")
+        pred = np.mean([m.predict(Xt) for m in ens], axis=0)
+        parts.append(pd.DataFrame({"forecast": np.clip(pred, 0, None), "model": f"{H}h"}, index=targets))
+    f = pd.concat(parts)
+
+    neso = fetch_neso_forecast(now)
+    f["neso_forecast"] = neso.reindex(f.index) if neso is not None else np.nan
+    f.index.name = "timestamp"
+    f.round(1).to_csv(LIVE_FORECAST)
+
+    # append to the log (once per forecast origin) so 'check' can score it later
+    log = pd.DataFrame({"issued_at": now, "target": f.index, "lead_hours": range(len(f)),
+                        "model": f["model"].values, "forecast": f["forecast"].round(1).values,
+                        "neso_forecast": f["neso_forecast"].round(1).values})
+    if os.path.exists(LIVE_LOG):
+        prev = pd.to_datetime(pd.read_csv(LIVE_LOG)["issued_at"], utc=True)
+        if (prev == now).any():
+            log = None
+    if log is not None:
+        log.to_csv(LIVE_LOG, mode="a", header=not os.path.exists(LIVE_LOG), index=False)
+
+    return f, now
+
+
+def live_cmd(hours, job_hours, deadline, power, now=None):
+    """Forecast the next 48 hours from now, print them and run the scheduler."""
+    f, now = live_forecast(now)
+
+    print("\nForecast (gCO2/kWh, UTC):")
+    show = f.round(0).copy()
+    show.index = show.index.strftime("%a %d %b %H:%M")
+    print(show.to_string())
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 4))
+        plt.plot(f.index, f["forecast"], label="XGBoost forecast", lw=1.8)
+        if f["neso_forecast"].notna().any():
+            plt.plot(f.index, f["neso_forecast"], label="NESO forecast (comparison)", lw=1, alpha=0.7)
+        plt.axvline(now + pd.Timedelta(hours=24), color="grey", ls=":", lw=1)
+        plt.ylabel("gCO2/kWh")
+        plt.title(f"Next 48 hours from {now:%Y-%m-%d %H:%M} UTC")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(HERE, "live_forecast.png"), dpi=120)
+        plt.close()
+    except ImportError:
+        pass
+
+    # hand over to the scheduler
+    S = import_scheduler()
+    write_csv(f["forecast"].iloc[:min(hours, 48)])
+    print(f"\nWrote {OUT} ({min(hours, 48)} hourly forecasts from {now:%Y-%m-%d %H:%M} UTC)\n")
+    run_scheduler(S, job_hours, deadline, power)
+    return f
+
+
+def check_table():
+    """Score the logged live forecasts against what the grid actually did.
+    Returns (summary table, hours scored, number of live runs, per-hour detail)."""
+    if not os.path.exists(LIVE_LOG):
+        raise SystemExit("No live_log.csv yet. Run 'live' first, then come back once those hours have passed.")
+    log = pd.read_csv(LIVE_LOG)
+    for c in ("issued_at", "target"):
+        log[c] = pd.to_datetime(log[c], utc=True)
+    now = pd.Timestamp.now(tz="UTC").floor("1h")
+    log = log[log["target"] < now - pd.Timedelta(hours=1)].copy()
+    if log.empty:
+        raise SystemExit("None of the logged forecast hours have passed yet. Check again later.")
+
+    actual = fetch_carbon_hourly(log["target"].min() - pd.Timedelta(hours=48), now)
+    log["actual"] = log["target"].map(actual)
+    lag = log["model"].map({"24h": 24, "48h": 48})
+    log["persistence"] = [actual.get(t - pd.Timedelta(hours=int(h)), np.nan) for t, h in zip(log["target"], lag)]
+    log = log.dropna(subset=["actual"])
+    if log.empty:
+        raise SystemExit("The real values for those hours are not available yet.")
+
+    rows = []
+    for model, g in log.groupby("model"):
+        for name, col in (("XGBoost", "forecast"), ("Persistence", "persistence"), ("NESO forecast", "neso_forecast")):
+            gg = g.dropna(subset=[col])
+            if gg.empty:
+                continue
+            err = gg[col] - gg["actual"]
+            rows.append({"horizon": model, "forecast": name, "hours": len(gg),
+                         "MAE": round(float(err.abs().mean()), 1),
+                         "RMSE": round(float(np.sqrt((err ** 2).mean())), 1),
+                         "MAPE %": round(float((err.abs() / gg["actual"]).mean() * 100), 1)})
+    return pd.DataFrame(rows), len(log), int(log["issued_at"].nunique()), log
+
+
+def check_cmd():
+    table, n_hours, n_runs, _ = check_table()
+    print(f"Scored {n_hours} forecast hours from {n_runs} live run(s):\n")
+    print(table.to_string(index=False))
 
 
 # =====================================================================
@@ -443,8 +741,26 @@ def main(argv=None):
         else:
             s.add_argument("--hour", type=int, default=12, help="daily job submission hour (UTC)")
 
+    r = sub.add_parser("refit", help="retrain on ALL data (including 2026); run once before 'live'")
+    r.add_argument("--csv", default=TRAIN_CSV)
+    r.add_argument("--seeds", type=int, default=5)
+
+    lv = sub.add_parser("live", help="forecast the next 48h from now using the real weather forecast")
+    lv.add_argument("--hours", type=int, default=48, help="rows to write to carbonwise.csv (max 48)")
+    lv.add_argument("--job-hours", type=int)
+    lv.add_argument("--deadline", type=int)
+    lv.add_argument("--power", type=float)
+
+    sub.add_parser("check", help="score earlier live forecasts against what really happened")
+
     args = ap.parse_args(argv)
-    if args.command == "train":
+    if args.command == "refit":
+        refit_cmd(resolve_path(args.csv), args.seeds)
+    elif args.command == "live":
+        live_cmd(args.hours, args.job_hours, args.deadline, args.power)
+    elif args.command == "check":
+        check_cmd()
+    elif args.command == "train":
         train_cmd(resolve_path(args.csv), not args.no_tune, args.trials, args.seeds)
     elif args.command == "schedule":
         schedule_cmd(args.now, args.hours, args.job_hours, args.deadline, args.power)

@@ -3,3 +3,6 @@ __pycache__/
 models/
 carbonwise.csv
 .env
+live_log.csv
+live_forecast.csv
+live_forecast.png
